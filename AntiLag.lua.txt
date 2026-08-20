@@ -1,0 +1,382 @@
+local shared = odh_shared_plugins
+if not shared then return end
+
+-- ==============================================
+-- SERVICES
+-- ==============================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+local LocalPlayer = Players.LocalPlayer
+
+local Stepped = RunService.Stepped
+local Heartbeat = RunService.Heartbeat
+
+local os_clock = os.clock
+local pcall = pcall
+local task_wait = task.wait
+local table_insert = table.insert
+local table_remove = table.remove
+
+-- ==============================================
+-- STATE
+-- ==============================================
+local lagFixEnabled = false
+local fixMaid = nil
+
+local networkOptimize = false
+local physicsOptimize = false
+local stateCull = false
+local gcControl = false
+local limitEvents = false
+local optimizeOwnership = false
+
+local cachedHumanoid = nil
+local cachedRoot = nil
+local lagConns = {}
+
+-- ==============================================
+-- NETWORK OPTIMIZATION
+-- ==============================================
+local function OptimizeNetwork(enable)
+    if not enable then
+        pcall(function() LocalPlayer:SetNetworkOwnershipAuto(true) end)
+        return
+    end
+    -- Disable auto-ownership to prevent constant changes
+    pcall(function() LocalPlayer:SetNetworkOwnershipAuto(false) end)
+    local char = LocalPlayer.Character
+    if char then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                pcall(function() part:SetNetworkOwner(LocalPlayer) end)
+            end
+        end
+    end
+end
+
+-- ==============================================
+-- PHYSICS OPTIMIZATION
+-- ==============================================
+local function OptimizePhysics(enable)
+    if not cachedRoot then return end
+    if enable then
+        pcall(function()
+            cachedRoot.CustomPhysicalProperties = PhysicalProperties.new(
+                5,          -- Density (lighter)
+                0.02,       -- Friction
+                0.10,       -- Elasticity (less bounce)
+                1000,       -- FrictionWeight
+                1000        -- ElasticityWeight
+            )
+            cachedRoot.RootPriority = 255  -- Higher priority for network updates
+        end)
+    else
+        pcall(function()
+            cachedRoot.CustomPhysicalProperties = PhysicalProperties.new(
+                10, 0.02, 0.15, 5000, 5000
+            )
+            cachedRoot.RootPriority = 0
+        end)
+    end
+end
+
+-- ==============================================
+-- STATE CULLING (reduce unused animations)
+-- ==============================================
+local function ApplyStateCull(h)
+    if not h then return end
+    local states = {
+        Enum.HumanoidStateType.Ragdoll,
+        Enum.HumanoidStateType.FallingDown,
+        Enum.HumanoidStateType.Seated,
+        Enum.HumanoidStateType.PlatformStanding,
+        Enum.HumanoidStateType.Swimming,
+        Enum.HumanoidStateType.Climbing,
+    }
+    for _, st in ipairs(states) do
+        pcall(function() h:SetStateEnabled(st, not stateCull) end)
+    end
+    -- Keep jump power normal
+    h.JumpPower = 54
+end
+
+local function ToggleStateCull(enable)
+    stateCull = enable
+    if cachedHumanoid then ApplyStateCull(cachedHumanoid) end
+    -- Also apply to other players? Could, but we only care about local for performance.
+end
+
+-- ==============================================
+-- GARBAGE COLLECTION CONTROL
+-- ==============================================
+local lastGC = 0
+local function ManageGC()
+    local now = os_clock()
+    if now - lastGC < 3 then return end  -- not too often
+    lastGC = now
+    pcall(function()
+        collectgarbage("step", 1)  -- incremental
+    end)
+end
+
+-- ==============================================
+-- EVENT THROTTLING (reduce spam on kills)
+-- ==============================================
+local function ThrottleEvents()
+    -- This is trickier: we can hook into common events and debounce.
+    -- For example, we can limit connections on CharacterAdded, etc.
+    -- But we can simply reduce the number of listeners by cleaning dead ones.
+    local now = os_clock()
+    for i = #lagConns, 1, -1 do
+        local c = lagConns[i]
+        if not c or not pcall(function() return c.Connected end) then
+            pcall(function() c:Disconnect() end)
+            lagConns[i] = nil
+        end
+    end
+end
+
+-- ==============================================
+-- MAIN FIX LOOP
+-- ==============================================
+local function StartLagFix()
+    if fixMaid then
+        fixMaid:Destroy()
+        fixMaid = nil
+    end
+
+    fixMaid = {
+        _tasks = {},
+        _destroyed = false
+    }
+
+    local function cleanupTask(task)
+        if not task then return end
+        local t = typeof(task)
+        if t == "RBXScriptConnection" then
+            task:Disconnect()
+        elseif t == "Instance" then
+            task:Destroy()
+        elseif t == "function" then
+            task()
+        end
+    end
+
+    fixMaid.GiveTask = function(self, task)
+        if self._destroyed then cleanupTask(task) return end
+        table_insert(self._tasks, task)
+        return task
+    end
+
+    fixMaid.Destroy = function(self)
+        if self._destroyed then return end
+        self._destroyed = true
+        for _, task in ipairs(self._tasks) do cleanupTask(task) end
+        self._tasks = {}
+    end
+
+    -- Optimize network on heartbeat (to maintain)
+    if networkOptimize or optimizeOwnership then
+        local netConn = Heartbeat:Connect(function()
+            if not lagFixEnabled then return end
+            if networkOptimize then
+                OptimizeNetwork(true)
+            end
+            if optimizeOwnership then
+                local char = LocalPlayer.Character
+                if char then
+                    for _, part in ipairs(char:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            pcall(function() part:SetNetworkOwner(LocalPlayer) end)
+                        end
+                    end
+                end
+            end
+        end)
+        fixMaid:GiveTask(netConn)
+    end
+
+    -- Physics optimization check on Stepped
+    if physicsOptimize then
+        local physConn = Stepped:Connect(function()
+            if not lagFixEnabled then return end
+            if cachedRoot then
+                OptimizePhysics(true)
+            end
+        end)
+        fixMaid:GiveTask(physConn)
+    end
+
+    -- State cull on CharacterAdded
+    local charConn = LocalPlayer.CharacterAdded:Connect(function(char)
+        task_wait(0.2)
+        cachedHumanoid = char:FindFirstChildOfClass("Humanoid")
+        cachedRoot = char:FindFirstChild("HumanoidRootPart")
+        if stateCull and cachedHumanoid then
+            ApplyStateCull(cachedHumanoid)
+        end
+        if physicsOptimize and cachedRoot then
+            OptimizePhysics(true)
+        end
+        if networkOptimize then
+            OptimizeNetwork(true)
+        end
+    end)
+    fixMaid:GiveTask(charConn)
+
+    -- GC control and event throttling (run periodically)
+    local gcConn = Heartbeat:Connect(function()
+        if not lagFixEnabled then return end
+        if gcControl then
+            ManageGC()
+        end
+        if limitEvents then
+            ThrottleEvents()
+        end
+    end)
+    fixMaid:GiveTask(gcConn)
+
+    -- Initial apply
+    if cachedHumanoid and stateCull then ApplyStateCull(cachedHumanoid) end
+    if cachedRoot and physicsOptimize then OptimizePhysics(true) end
+    if networkOptimize then OptimizeNetwork(true) end
+
+    shared.Notify("Anti-Lag started", 0.6)
+end
+
+local function StopLagFix()
+    if fixMaid then
+        fixMaid:Destroy()
+        fixMaid = nil
+    end
+    -- Reset to defaults
+    pcall(function() LocalPlayer:SetNetworkOwnershipAuto(true) end)
+    if cachedRoot then
+        pcall(function()
+            cachedRoot.CustomPhysicalProperties = PhysicalProperties.new(10, 0.02, 0.15, 5000, 5000)
+            cachedRoot.RootPriority = 0
+        end)
+    end
+    if cachedHumanoid then
+        -- Restore all states
+        local states = {
+            Enum.HumanoidStateType.Ragdoll,
+            Enum.HumanoidStateType.FallingDown,
+            Enum.HumanoidStateType.Seated,
+            Enum.HumanoidStateType.PlatformStanding,
+            Enum.HumanoidStateType.Swimming,
+            Enum.HumanoidStateType.Climbing,
+        }
+        for _, st in ipairs(states) do
+            pcall(function() cachedHumanoid:SetStateEnabled(st, true) end)
+        end
+        cachedHumanoid.JumpPower = 50
+    end
+    -- Clear connections
+    for i = #lagConns, 1, -1 do
+        local c = lagConns[i]
+        pcall(function() c:Disconnect() end)
+        lagConns[i] = nil
+    end
+    shared.Notify("Anti-Lag stopped", 0.6)
+end
+
+-- ==============================================
+-- UI (no graphics options)
+-- ==============================================
+local AntiLagSection = shared.AddSection("Anti-Lag")
+
+AntiLagSection:AddToggle("Enable Anti-Lag", function(s)
+    lagFixEnabled = s
+    if s then
+        StartLagFix()
+    else
+        StopLagFix()
+    end
+    shared.Notify("Anti-Lag: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("Network Optimize", function(s)
+    networkOptimize = s
+    if lagFixEnabled then
+        if s then OptimizeNetwork(true) else OptimizeNetwork(false) end
+    end
+    shared.Notify("Network Optimize: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("Physics Optimize", function(s)
+    physicsOptimize = s
+    if lagFixEnabled and cachedRoot then
+        OptimizePhysics(s)
+    end
+    shared.Notify("Physics Optimize: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("State Culling", function(s)
+    ToggleStateCull(s)
+    shared.Notify("State Culling: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("GC Control", function(s)
+    gcControl = s
+    shared.Notify("GC Control: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("Event Throttling", function(s)
+    limitEvents = s
+    shared.Notify("Event Throttling: " .. (s and "ON" or "OFF"), 1)
+end)
+
+AntiLagSection:AddToggle("Ownership Lock", function(s)
+    optimizeOwnership = s
+    if lagFixEnabled and s then
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    pcall(function() part:SetNetworkOwner(LocalPlayer) end)
+                end
+            end
+        end
+    end
+    shared.Notify("Ownership Lock: " .. (s and "ON" or "OFF"), 1)
+end)
+
+-- ==============================================
+-- CHARACTER CACHE
+-- ==============================================
+LocalPlayer.CharacterAdded:Connect(function(char)
+    cachedHumanoid = nil
+    cachedRoot = nil
+    task_wait(0.2)
+    cachedHumanoid = char:FindFirstChildOfClass("Humanoid")
+    cachedRoot = char:FindFirstChild("HumanoidRootPart")
+    if lagFixEnabled then
+        if stateCull and cachedHumanoid then ApplyStateCull(cachedHumanoid) end
+        if physicsOptimize and cachedRoot then OptimizePhysics(true) end
+        if networkOptimize then OptimizeNetwork(true) end
+    end
+end)
+
+if LocalPlayer.Character then
+    cachedHumanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    cachedRoot = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+end
+
+-- ==============================================
+-- UNLOAD
+-- ==============================================
+if not getgenv().UnloadAntiLag then
+    getgenv().UnloadAntiLag = function()
+        lagFixEnabled = false
+        StopLagFix()
+        shared.Notify("Anti-Lag unloaded", 1)
+    end
+end
+
+shared.Notify("Anti-Lag plugin loaded (no graphics)", 2)
+shared.Notify("Use UnloadAntiLag() to unload", 2)
+print("Anti-Lag plugin loaded – performance without visual changes")
