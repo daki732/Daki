@@ -1,0 +1,351 @@
+local shared = odh_shared_plugins
+local section = shared.AddSection("MM2 Trade Calculator")
+
+-- Конфигурация
+local config = {
+    auto_update = true,
+    show_prices = true,
+    update_interval = 0.5
+}
+
+-- Основные переменные
+local price_data = {}
+local rarity_colors = {
+    common = Color3.fromRGB(106,106,106),
+    uncommon = Color3.fromRGB(0,255,255),
+    rare = Color3.fromRGB(0,200,0),
+    legendary = Color3.fromRGB(220,0,5),
+    godly_chroma = Color3.fromRGB(255,0,179),
+    vintage = Color3.fromRGB(230,200,0),
+    ancient_evo = Color3.fromRGB(100,10,255)
+}
+local item_cache = {}
+local loaded = false
+
+-- Вспомогательные функции
+local function clean_name(name)
+    local cleaned = tostring(name):gsub("%s*%b()%s*$", "")
+    return cleaned:match("^%s*(.-)%s*$") or cleaned
+end
+
+local function normalize_name(name)
+    if item_cache[name] then return item_cache[name] end
+    local normalized = clean_name(name):lower()
+    item_cache[name] = normalized
+    return normalized
+end
+
+local function get_rarity_from_color(color)
+    if not color then return "unknown" end
+    
+    local closest = "unknown"
+    local min_dist = math.huge
+    
+    for rarity, c in pairs(rarity_colors) do
+        local dist = math.sqrt(
+            (color.R * 255 - c.R * 255)^2 +
+            (color.G * 255 - c.G * 255)^2 +
+            (color.B * 255 - c.B * 255)^2
+        )
+        if dist < min_dist then
+            min_dist = dist
+            closest = rarity
+        end
+    end
+    
+    return min_dist < 15 and closest or "unknown"
+end
+
+local function get_item_price(name, rarity)
+    if not name or name == "" then return nil end
+    
+    local clean = clean_name(name)
+    local normalized = normalize_name(name)
+    
+    local variants = {
+        clean .. "_" .. rarity,
+        name .. "_" .. rarity,
+        clean .. "_unknown",
+        clean,
+        name
+    }
+    
+    for _, key in ipairs(variants) do
+        if price_data[key] ~= nil then
+            return price_data[key]
+        end
+        if price_data[key:lower()] ~= nil then
+            return price_data[key:lower()]
+        end
+    end
+    
+    return nil
+end
+
+-- Загрузка данных с GitHub
+local function fetch_prices()
+    task.spawn(function()
+        local success, result = pcall(function()
+            return game:HttpGet("https://raw.githubusercontent.com/Kenderlike/mm2-prices/refs/heads/main/prices.json")
+        end)
+        
+        if success and result then
+            local decode_success, data = pcall(function()
+                return game:GetService("HttpService"):JSONDecode(result)
+            end)
+            
+            if decode_success and type(data) == "table" then
+                price_data = {}
+                
+                local function parse_table(tbl)
+                    for key, value in pairs(tbl) do
+                        if type(value) == "table" then
+                            local has_rarity = false
+                            for r,_ in pairs(value) do
+                                if rarity_colors[r] then
+                                    has_rarity = true
+                                    break
+                                end
+                            end
+                            
+                            if has_rarity then
+                                for rarity, price in pairs(value) do
+                                    price_data[key .. "_" .. rarity] = price
+                                    price_data[key:lower() .. "_" .. rarity] = price
+                                end
+                            else
+                                parse_table(value)
+                            end
+                        else
+                            price_data[key] = value
+                            price_data[key:lower()] = value
+                        end
+                    end
+                end
+                
+                parse_table(data)
+                loaded = true
+                shared.Notify("✅ MM2 Price Database loaded!", 3)
+            else
+                shared.Notify("❌ Failed to parse JSON data", 3)
+            end
+        else
+            shared.Notify("❌ Failed to fetch price data", 3)
+        end
+    end)
+end
+
+-- Отображение цен на предметы
+local function add_price_tag(item, price)
+    local parent = item.Parent
+    if not parent then return end
+    
+    -- Находим контейнер предмета
+    local container = parent.Parent
+    if not container or not container:IsA("GuiObject") or 
+       container.AbsoluteSize.X > 350 or container.AbsoluteSize.Y > 350 then
+        container = parent
+    end
+    
+    local tag = container:FindFirstChild("MM2_PriceTag")
+    if not tag then
+        tag = Instance.new("TextLabel")
+        tag.Name = "MM2_PriceTag"
+        tag.Size = UDim2.new(1,0,0,20)
+        tag.Position = UDim2.new(0,0,0,0)
+        tag.BackgroundTransparency = 1
+        tag.TextStrokeTransparency = 0
+        tag.TextSize = 16
+        tag.Font = Enum.Font.GothamBlack
+        tag.ZIndex = 100
+        tag.BorderSizePixel = 0
+        tag.Parent = container
+    end
+    
+    if type(price) == "number" then
+        tag.Text = price == 0 and "0" or tostring(price)
+        tag.TextColor3 = price == 0 and Color3.fromRGB(200,100,100) or Color3.fromRGB(46,204,113)
+    else
+        tag.Text = price
+        tag.TextColor3 = Color3.fromRGB(255,200,100)
+    end
+end
+
+local function get_item_rarity(item)
+    local parent = item.Parent
+    if parent and parent:IsA("GuiObject") and parent.BackgroundTransparency < 1 then
+        return get_rarity_from_color(parent:IsA("Frame") and parent.BackgroundColor3 or parent.ImageColor3)
+    end
+    return "unknown"
+end
+
+-- Поиск предметов в интерфейсе
+local function scan_items()
+    local items = {}
+    local trade_gui = nil
+    
+    local player_gui = game.Players.LocalPlayer:FindFirstChild("PlayerGui")
+    if not player_gui then return items, trade_gui end
+    
+    for _, gui in ipairs(player_gui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled and 
+           gui.Name ~= "Chat" and gui.Name ~= "BubbleChat" and gui.Name ~= "PlayerList" then
+            
+            local descendants = gui:GetDescendants()
+            for i, obj in ipairs(descendants) do
+                if i % 300 == 0 then task.wait() end
+                
+                if obj:IsA("TextLabel") and obj.Name ~= "MM2_PriceTag" then
+                    local parent = obj.Parent
+                    if parent and (parent:IsA("Frame") or parent:IsA("ImageLabel") or parent:IsA("ImageButton")) then
+                        table.insert(items, obj)
+                    end
+                end
+                
+                if obj.Name == "Trade" and obj:IsA("GuiObject") and obj.Visible and obj:FindFirstChild("Player1") then
+                    trade_gui = obj
+                end
+            end
+        end
+    end
+    
+    return items, trade_gui
+end
+
+-- Расчет стоимости стороны трейда
+local function calculate_trade_value(offer_container)
+    local total = 0
+    if not offer_container then return total end
+    
+    for _, obj in ipairs(offer_container:GetChildren()) do
+        if obj:IsA("GuiObject") then
+            for _, label in ipairs(obj:GetDescendants()) do
+                if label:IsA("TextLabel") and label.Name ~= "MM2_PriceTag" then
+                    local text = label.Text
+                    if text and #text > 0 and #text < 35 then
+                        local normalized = normalize_name(text)
+                        local rarity = get_item_rarity(label)
+                        local price = get_item_price(text, rarity)
+                        
+                        if type(price) == "number" then
+                            total = total + price
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return total
+end
+
+-- Обновление интерфейса
+local function update_display()
+    local scanning = true
+    
+    task.spawn(function()
+        while scanning do
+            if loaded then
+                local items, trade_gui = scan_items()
+                
+                -- Обновляем ценники
+                for _, item in ipairs(items) do
+                    if item.Parent then
+                        local text = item.Text
+                        if text and #text > 0 and #text < 35 then
+                            local normalized = normalize_name(text)
+                            local rarity = get_item_rarity(item)
+                            local price = get_item_price(text, rarity)
+                            
+                            if price ~= nil then
+                                add_price_tag(item, price)
+                            end
+                        end
+                    end
+                end
+                
+                -- Обновляем информацию о трейде
+                if trade_gui and trade_gui.Parent and trade_gui.Visible then
+                    local player1_offer = trade_gui:FindFirstChild("Player1") and trade_gui.Player1:FindFirstChild("Offer")
+                    local player2_offer = trade_gui:FindFirstChild("Player2") and trade_gui.Player2:FindFirstChild("Offer")
+                    
+                    local value1 = player1_offer and calculate_trade_value(player1_offer) or 0
+                    local value2 = player2_offer and calculate_trade_value(player2_offer) or 0
+                    
+                    local diff = value1 - value2
+                    
+                    if math.abs(diff) > 10 then
+                        shared.Notify(
+                            (diff > 0 and "📈 WIN (+" or "📉 LOSE (") .. diff .. ")", 
+                            2
+                        )
+                    end
+                end
+            end
+            task.wait(config.update_interval)
+        end
+    end)
+end
+
+-- UI Элементы плагина
+section:AddLabel("💰 MM2 Trade Value Calculator")
+
+-- Toggle: Включить/выключить
+section:AddToggle("Enable Calculator", function(enabled)
+    if enabled then
+        fetch_prices()
+        update_display()
+        shared.Notify("MM2 Calculator enabled", 2)
+    else
+        shared.Notify("MM2 Calculator disabled", 2)
+    end
+end)
+
+-- Toggle: Показывать цены
+section:AddToggle("Show Prices on Items", function(enabled)
+    config.show_prices = enabled
+    if enabled then
+        shared.Notify("Prices will be shown on items", 2)
+    else
+        -- Удаляем все ценники
+        for _, gui in ipairs(game.Players.LocalPlayer.PlayerGui:GetDescendants()) do
+            if gui.Name == "MM2_PriceTag" then
+                gui:Destroy()
+            end
+        end
+        shared.Notify("Prices hidden", 2)
+    end
+end)
+
+-- Button: Принудительное обновление
+section:AddButton("🔄 Refresh Prices", function()
+    shared.Notify("Refreshing price database...", 2)
+    loaded = false
+    fetch_prices()
+end)
+
+-- Button: Очистить ценники
+section:AddButton("🗑️ Clear Price Tags", function()
+    local count = 0
+    for _, gui in ipairs(game.Players.LocalPlayer.PlayerGui:GetDescendants()) do
+        if gui.Name == "MM2_PriceTag" then
+            gui:Destroy()
+            count = count + 1
+        end
+    end
+    shared.Notify("Removed " .. count .. " price tags", 2)
+end)
+
+-- Информация
+section:AddParagraph("ℹ️ Info", "Automatically detects MM2 items and shows their values.\nValues are based on the latest price data.")
+
+-- Статус
+section:AddLabel("Status: " .. (loaded and "✅ Loaded" or "⏳ Loading..."))
+
+-- Идентификаторы
+print("👤 Discord:", shared.discord_name)
+print("🆔 Discord ID:", shared.discord_id)
+print("💻 Executor:", shared.executor)
+
+shared.Notify("💎 MM2 Trade Calculator loaded!", 3)
