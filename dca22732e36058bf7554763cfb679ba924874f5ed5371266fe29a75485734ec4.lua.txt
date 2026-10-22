@@ -1,0 +1,658 @@
+local table_insert = table.insert
+local table_remove = table.remove
+local table_create = table.create
+local math_ceil = math.ceil
+local math_floor = math.floor
+local math_sqrt = math.sqrt
+local math_clamp = math.clamp
+local math_huge = math.huge
+local Vector3_new = Vector3.new
+local CFrame_new = CFrame.new
+local CFrame_lookAt = CFrame.lookAt
+local tick = tick
+local typeof = typeof
+local type = type
+local ipairs = ipairs
+
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+    return setmetatable({_tasks = {}, _destroyed = false}, Maid)
+end
+
+function Maid:GiveTask(task)
+    if self._destroyed then
+        self:_cleanupTask(task)
+        return
+    end
+
+    table_insert(self._tasks, task)
+    return task
+end
+
+function Maid:GiveTasks(...)
+    for _, task in ipairs({...}) do
+        self:GiveTask(task)
+    end
+end
+
+function Maid:_cleanupTask(task)
+    local taskType = typeof(task)
+
+    if taskType == "RBXScriptConnection" then
+        task:Disconnect()
+    elseif taskType == "Instance" then
+        task:Destroy()
+    elseif taskType == "function" then
+        task()
+    elseif taskType == "table" and type(task.Destroy) == "function" then
+        task:Destroy()
+    end
+end
+
+function Maid:DoCleaning()
+    if self._destroyed then return end
+
+    self._destroyed = true
+
+    for _, task in ipairs(self._tasks) do
+        self:_cleanupTask(task)
+    end
+
+    self._tasks = {}
+end
+
+function Maid:Destroy()
+    self:DoCleaning()
+end
+
+local RootMaid = Maid.new()
+local shared = odh_shared_plugins
+
+task.spawn(function()
+    shared.load_from_github_url("/aux0on/CrashHandler/refs/heads/main/Prevention.lua")
+end)
+
+if shared.game_name ~= "Murder Mystery 2" then return end
+
+local gp = shared.CreateTab("Firefly Shield", "/aux0on/GPIcon/refs/heads/main/Untitled163_20260919034104")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local slots = {
+    {key = "TL", label = "Top-Left", x = -1.0, y = 1.0, z = 0},
+    {key = "TC", label = "Top-Center", x = 0.0, y = 1.0, z = 0},
+    {key = "TR", label = "Top-Right", x = 1.0, y = 1.0, z = 0},
+    {key = "ML", label = "Middle-Left", x = -1.0, y = 0.0, z = 0},
+    {key = "MC", label = "Middle-Center", x = 0.0, y = 0.0, z = 0},
+    {key = "MR", label = "Middle-Right", x = 1.0, y = 0.0, z = 0},
+    {key = "BC", label = "Bottom-Center", x = 0.0, y = -1.0, z = 0},
+}
+
+local config = {
+    offset = 1.5,
+    height = 0,
+    followSpeed = 12,
+    maxFireflies = 50,
+    rescanTime = 0.2,
+
+    blockRange = 50,
+    threatTimeout = 0.3,
+
+    lineLength = 20,
+    lineBackOffset = 4,
+
+    staticStartOffset = 2,
+    staticLineLength = 25,
+    staticTimeout = 15,
+}
+
+local features = {
+    enabled = false,
+    blockKnives = false,
+    blockKnivesStatic = false,
+}
+
+local fireflyList = {}
+local tracked = {}
+local smoothDir = nil
+local accumulator = 0
+local isRunning = false
+local loopMaid = Maid.new()
+local activeThreatTime = nil
+local activeStaticLine = nil
+
+local function killMovers(part)
+    local children = part:GetChildren()
+
+    for i = 1, #children do
+        local child = children[i]
+
+        if child:IsA("BodyVelocity")
+            or child:IsA("BodyAngularVelocity")
+            or child:IsA("BodyPosition")
+            or child:IsA("BodyGyro")
+            or child:IsA("AlignPosition")
+            or child:IsA("AlignOrientation") then
+            child:Destroy()
+        end
+    end
+end
+
+local layoutCacheCount = -1
+local layoutCacheOffsets = nil
+
+local function getLayoutOffsets(count)
+    if layoutCacheCount == count and layoutCacheOffsets then
+        return layoutCacheOffsets
+    end
+
+    local offsets = table_create(count)
+
+    if count <= #slots then
+        for i = 1, count do
+            local slot = slots[i]
+            offsets[i] = Vector3_new(slot.x, slot.y, slot.z)
+        end
+    else
+        local cols = math_ceil(math_sqrt(count))
+        local rows = math_ceil(count / cols)
+        local stepX = (cols > 1) and (2 / (cols - 1)) or 0
+        local stepY = (rows > 1) and (2 / (rows - 1)) or 0
+        local itemsInLastRow = count % cols
+
+        for i = 0, count - 1 do
+            local row = math_floor(i / cols)
+            local col = i % cols
+            local x = -1 + (col * stepX)
+            local y = -1 + (row * stepY)
+
+            if row == rows - 1 and itemsInLastRow > 0 and itemsInLastRow < cols then
+                x = x + ((cols - itemsInLastRow) * stepX / 2)
+            end
+
+            offsets[i + 1] = Vector3_new(x, y, 0)
+        end
+    end
+
+    layoutCacheCount = count
+    layoutCacheOffsets = offsets
+
+    return offsets
+end
+
+local function hasKillerTool(container)
+    if not container then return false end
+
+    local children = container:GetChildren()
+
+    for i = 1, #children do
+        local item = children[i]
+
+        if item:IsA("Tool") and item.Name:lower():find("knife", 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function findThreatRoot(myRoot)
+    local best = nil
+    local bestDistance = math_huge
+    local myPosition = myRoot.Position
+    local players = Players:GetPlayers()
+
+    for i = 1, #players do
+        local player = players[i]
+
+        if player ~= LocalPlayer then
+            local character = player.Character
+
+            if character then
+                local root = character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+                if root and humanoid and humanoid.Health > 0 then
+                    if hasKillerTool(character)
+                        or hasKillerTool(player:FindFirstChildOfClass("Backpack")) then
+
+                        local distance = (root.Position - myPosition).Magnitude
+
+                        if distance < bestDistance then
+                            bestDistance = distance
+                            best = root
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function getThreatDir(myRoot)
+    local threat = findThreatRoot(myRoot)
+
+    if threat then
+        local threatPosition = threat.Position
+        local myPosition = myRoot.Position
+
+        local flat = Vector3_new(
+            threatPosition.X - myPosition.X,
+            0,
+            threatPosition.Z - myPosition.Z
+        )
+
+        if flat.Magnitude > 0.05 then
+            return flat.Unit
+        end
+    end
+
+    local look = myRoot.CFrame.LookVector
+    local behind = Vector3_new(-look.X, 0, -look.Z)
+
+    if behind.Magnitude < 0.05 then
+        behind = Vector3_new(0, 0, 1)
+    end
+
+    return behind.Unit
+end
+
+local function findNearestKnife(myRoot)
+    local bestPosition = nil
+    local bestDirection = nil
+    local bestDistance = math_huge
+    local blockRange = config.blockRange
+    local myPosition = myRoot.Position
+    local objects = Workspace:GetChildren()
+
+    for i = 1, #objects do
+        local obj = objects[i]
+
+        if obj.Name:lower() == "throwingknife" then
+            local part = obj:IsA("BasePart") and obj
+                or obj:FindFirstChildWhichIsA("BasePart")
+
+            if part then
+                local velocity = part.AssemblyLinearVelocity
+                local direction
+
+                if velocity.Magnitude > 1 then
+                    direction = velocity.Unit
+                else
+                    direction = part.CFrame.LookVector
+                end
+
+                local position = part.Position
+                local distance = (position - myPosition).Magnitude
+
+                if distance <= blockRange and distance < bestDistance then
+                    bestDistance = distance
+                    bestPosition = position
+                    bestDirection = direction
+                end
+            end
+        end
+    end
+
+    return bestPosition, bestDirection
+end
+
+local function applyMovingBlock(threatPosition, threatDirection)
+    local fireflies = fireflyList
+    local count = #fireflies
+
+    if count == 0 then return end
+
+    local cfg = config
+    local lineStart = threatPosition - threatDirection * cfg.lineBackOffset
+    local lineEnd = lineStart + threatDirection * cfg.lineLength
+
+    for i = 1, count do
+        local obj = fireflies[i]
+
+        if obj and obj.Parent then
+            local t = (count > 1) and ((i - 1) / (count - 1)) or 0.5
+
+            obj.CFrame = CFrame_new(lineStart:Lerp(lineEnd, t))
+            obj.Anchored = true
+            obj.CanCollide = true
+        end
+    end
+end
+
+local function applyStaticLine(lineData)
+    local fireflies = fireflyList
+    local count = #fireflies
+
+    if count == 0 then return end
+
+    local cfg = config
+    local startPosition = lineData.start + lineData.dir * cfg.staticStartOffset
+    local endPosition = startPosition + lineData.dir * cfg.staticLineLength
+
+    for i = 1, count do
+        local obj = fireflies[i]
+
+        if obj and obj.Parent then
+            local t = (count > 1) and ((i - 1) / (count - 1)) or 0.5
+
+            obj.CFrame = CFrame_new(startPosition:Lerp(endPosition, t))
+            obj.Anchored = true
+            obj.CanCollide = true
+        end
+    end
+end
+
+local function collectFireflies()
+    local cfg = config
+    local fireflies = fireflyList
+    local fireflyCount = #fireflies
+    local descendants = Workspace:GetDescendants()
+
+    for i = 1, #descendants do
+        local obj = descendants[i]
+
+        if obj:IsA("BasePart") and obj.Name == "Firefly" and not tracked[obj] then
+            if fireflyCount >= cfg.maxFireflies then break end
+
+            tracked[obj] = true
+            fireflyCount = fireflyCount + 1
+
+            table_insert(fireflies, obj)
+            killMovers(obj)
+
+            pcall(function()
+                if obj:GetNetworkOwner() ~= LocalPlayer then
+                    obj:SetNetworkOwner(LocalPlayer)
+                end
+
+                obj.Anchored = true
+                obj.CanCollide = false
+            end)
+        end
+    end
+
+    for i = #fireflies, 1, -1 do
+        local obj = fireflies[i]
+
+        if not obj or not obj.Parent then
+            if obj then
+                tracked[obj] = nil
+            end
+
+            table_remove(fireflies, i)
+        end
+    end
+end
+
+local function updateFireflies(dt)
+    local cfg = config
+    local currentFeatures = features
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+
+    if not root then return end
+
+    if currentFeatures.blockKnivesStatic then
+        local knifePosition, knifeDirection = findNearestKnife(root)
+
+        if activeStaticLine then
+            local timedOut = (tick() - activeStaticLine.startTime) > cfg.staticTimeout
+            local lostContact = not knifePosition
+                and (tick() - activeStaticLine.lastSeenTime) > cfg.threatTimeout
+
+            if timedOut or lostContact then
+                activeStaticLine = nil
+            else
+                if knifePosition then
+                    activeStaticLine.lastSeenTime = tick()
+                end
+
+                applyStaticLine(activeStaticLine)
+                return
+            end
+        elseif knifePosition then
+            activeStaticLine = {
+                start = knifePosition,
+                dir = knifeDirection,
+                startTime = tick(),
+                lastSeenTime = tick(),
+            }
+
+            applyStaticLine(activeStaticLine)
+            return
+        end
+    end
+
+    if not currentFeatures.blockKnivesStatic and currentFeatures.blockKnives then
+        local threatPosition, threatDirection = findNearestKnife(root)
+
+        if threatPosition then
+            activeThreatTime = tick()
+            applyMovingBlock(threatPosition, threatDirection)
+            return
+        elseif activeThreatTime and (tick() - activeThreatTime) < cfg.threatTimeout then
+            return
+        else
+            activeThreatTime = nil
+        end
+    end
+
+    local targetDirection = getThreatDir(root)
+
+    if smoothDir then
+        local alpha = math_clamp(cfg.followSpeed * dt, 0, 1)
+        local blended = smoothDir:Lerp(targetDirection, alpha)
+
+        if blended.Magnitude > 0.001 then
+            smoothDir = blended.Unit
+        end
+    else
+        smoothDir = targetDirection
+    end
+
+    local fireflies = fireflyList
+    local count = #fireflies
+
+    if count == 0 then return end
+
+    local direction = smoothDir
+    local rotation = CFrame_lookAt(Vector3.zero, -direction)
+    local center = root.Position
+        + Vector3_new(0, cfg.height, 0)
+        + direction * cfg.offset
+    local offsets = getLayoutOffsets(count)
+
+    for i = 1, count do
+        local obj = fireflies[i]
+
+        if obj and obj.Parent then
+            local offset = offsets[i]
+
+            if offset then
+                obj.CFrame = CFrame_new(center + (rotation * offset))
+                obj.CanCollide = false
+            end
+        end
+    end
+end
+
+local function startFireflies()
+    if isRunning then return end
+
+    isRunning = true
+    smoothDir = nil
+    accumulator = 0
+    fireflyList = {}
+    tracked = {}
+    activeThreatTime = nil
+    activeStaticLine = nil
+
+    loopMaid:GiveTask(RunService.Heartbeat:Connect(function(dt)
+        accumulator = accumulator + dt
+
+        if accumulator > config.rescanTime then
+            accumulator = 0
+            collectFireflies()
+        end
+
+        updateFireflies(dt)
+    end))
+end
+
+local function stopFireflies()
+    isRunning = false
+    loopMaid:DoCleaning()
+    loopMaid = Maid.new()
+
+    local fireflies = fireflyList
+
+    for i = 1, #fireflies do
+        local obj = fireflies[i]
+
+        if obj and obj.Parent then
+            pcall(function()
+                obj.Anchored = false
+                obj.CanCollide = true
+                obj:SetNetworkOwner(nil)
+            end)
+        end
+    end
+
+    fireflyList = {}
+    tracked = {}
+    smoothDir = nil
+    activeThreatTime = nil
+    activeStaticLine = nil
+end
+
+local mainSection = gp:AddSection("Firefly Shield", "Main")
+
+mainSection:AddToggle("Enable Firefly Shield", function(bool)
+    features.enabled = bool
+
+    if bool then
+        startFireflies()
+    else
+        stopFireflies()
+    end
+end)
+
+mainSection:AddToggle("Enable Block Thrown Knives", function(bool)
+    features.blockKnives = bool
+
+    if not bool then
+        activeThreatTime = nil
+    end
+end)
+
+mainSection:AddToggle("Block Throw Static", function(bool)
+    features.blockKnivesStatic = bool
+
+    if not bool then
+        activeStaticLine = nil
+    end
+end)
+
+local function addFireflySliders(section, slot)
+    section:AddSlider(slot.label .. " X", -5, 5, slot.x, function(v)
+        slot.x = v
+        layoutCacheCount = -1
+    end)
+
+    section:AddSlider(slot.label .. " Y", -5, 5, slot.y, function(v)
+        slot.y = v
+        layoutCacheCount = -1
+    end)
+
+    section:AddSlider(slot.label .. " Z", -5, 5, slot.z, function(v)
+        slot.z = v
+        layoutCacheCount = -1
+    end)
+end
+
+local topSection = gp:AddSection("Top Row", "Fireflies")
+addFireflySliders(topSection, slots[1])
+addFireflySliders(topSection, slots[2])
+addFireflySliders(topSection, slots[3])
+
+local midSection = gp:AddSection("Middle Row", "Fireflies")
+addFireflySliders(midSection, slots[4])
+addFireflySliders(midSection, slots[5])
+addFireflySliders(midSection, slots[6])
+
+local bottomSection = gp:AddSection("Bottom Row", "Fireflies")
+addFireflySliders(bottomSection, slots[7])
+
+local globalSection = gp:AddSection("Global Settings", "Fireflies")
+
+globalSection:AddSlider("Distance From Character", 0.5, 5.0, config.offset, function(v)
+    config.offset = v
+end)
+
+globalSection:AddSlider("Height Offset", -4, 4, config.height, function(v)
+    config.height = v
+end)
+
+globalSection:AddSlider("Follow Speed", 1, 30, config.followSpeed, function(v)
+    config.followSpeed = v
+end)
+
+globalSection:AddSlider("Max Fireflies", 1, 100, config.maxFireflies, function(v)
+    config.maxFireflies = math_floor(v)
+end)
+
+local movingBlockSection = gp:AddSection("Moving Knife Block", "Fireflies")
+
+movingBlockSection:AddSlider("Trigger Range", 10, 120, config.blockRange, function(v)
+    config.blockRange = v
+end)
+
+movingBlockSection:AddSlider("Line Length", 5, 60, config.lineLength, function(v)
+    config.lineLength = v
+end)
+
+movingBlockSection:AddSlider("Line Back Offset", 0, 20, config.lineBackOffset, function(v)
+    config.lineBackOffset = v
+end)
+
+movingBlockSection:AddSlider("Return Delay (s)", 0, 1, config.threatTimeout, function(v)
+    config.threatTimeout = v
+end)
+
+local staticBlockSection = gp:AddSection("Static Knife Block", "Fireflies")
+
+staticBlockSection:AddSlider("Trigger Range", 10, 120, config.blockRange, function(v)
+    config.blockRange = v
+end)
+
+staticBlockSection:AddSlider("Start Offset", 0, 15, config.staticStartOffset, function(v)
+    config.staticStartOffset = v
+end)
+
+staticBlockSection:AddSlider("Line Length", 5, 60, config.staticLineLength, function(v)
+    config.staticLineLength = v
+end)
+
+staticBlockSection:AddSlider("Return Delay (s)", 0, 1, config.threatTimeout, function(v)
+    config.threatTimeout = v
+end)
+
+staticBlockSection:AddSlider("Hard Timeout (s)", 1, 60, config.staticTimeout, function(v)
+    config.staticTimeout = v
+end)
+
+RootMaid:GiveTask(function()
+    features.enabled = false
+    features.blockKnives = false
+    features.blockKnivesStatic = false
+    stopFireflies()
+end)
